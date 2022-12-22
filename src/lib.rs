@@ -1,7 +1,17 @@
 pub mod matrix {
+    use std::fmt::Error;
+
+    use nix::unistd::ForkResult;
+
     #[derive(Debug)]
     pub enum MatrixCalcError {
         NonSquare,
+    }
+
+    pub fn print_matrix(matrix: &Vec<Vec<i64>>) {
+        for row in matrix {
+            println!("{:?}", row);
+        }
     }
 
     pub fn calculate_determinant(
@@ -14,59 +24,123 @@ pub mod matrix {
         }
 
         if matrix.len() > 2 {
-            // return match exclude_row {
-            //     None => calculate_determinant(matrix, Some(0), Some(0)),
-            //     Some(val) => {
-            //         if val >= matrix.len() {
-            //             return Ok(val as i64);
-            //         } else {
-            //             let stripped_matrix = subtract_row_and_col(matrix, exclude_row.unwrap(), 0);
-            //             println!("---------------------------------------------");
-            //             let sign = ((exclude_row.unwrap() as i64 % 2) * -2) + 1;
-            //             let coef = matrix[exclude_row.unwrap()][0];
-            //             let cur = calculate_determinant(&stripped_matrix, Some(0), _exclude_col)
-            //                 .expect("msg");
-            //             let next = calculate_determinant(
-            //                 matrix,
-            //                 Some(exclude_row.unwrap() + 1),
-            //                 _exclude_col,
-            //             )
-            //             .expect("msg");
-            //             println!("{} * {} * {} + {}", sign, coef, cur, next);
-            //             return Ok(sign * coef * cur + next);
-            //         }
-            //     }
-            // };
-
-            if exclude_row.is_some() && exclude_row.unwrap() >= matrix.len() {
-                Ok(0)
-            } else if exclude_row.is_some() {
-                let stripped_matrix = subtract_row_and_col(matrix, exclude_row.unwrap(), 0);
-                println!("---------------------------------------------");
-                let sign = ((exclude_row.unwrap() as i64 % 2) * -2) + 1;
-                let coef = matrix[exclude_row.unwrap()][0];
-                let cur =
-                    calculate_determinant(&stripped_matrix, Some(0), _exclude_col).expect("msg");
-                let next =
-                    calculate_determinant(matrix, Some(exclude_row.unwrap() + 1), _exclude_col)
-                        .expect("msg");
-                println!("{} * {} * {} + {}", sign, coef, cur, next);
-                Ok(sign * coef * cur + next)
-            } else {
-                calculate_determinant(matrix, Some(0), Some(0))
+            match exclude_row {
+                None => calculate_determinant(matrix, Some(0), Some(0)),
+                Some(row) => {
+                    if row >= matrix.len() {
+                        Ok(0)
+                    } else {
+                        let stripped_matrix = select_minor(matrix, row, 0);
+                        let sign = ((row as i64 % 2) * -2) + 1;
+                        let coef = matrix[row][0];
+                        let deeper_det =
+                            calculate_determinant(&stripped_matrix, Some(0), _exclude_col)
+                                .expect("msg");
+                        // let next_det = calculate_determinant(matrix, Some(row + 1), _exclude_col)
+                        //     .expect("msg");
+                        Ok(sign * coef * deeper_det)
+                    }
+                }
             }
         } else {
-            println!("---------------------------------------------");
             let result = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
-            println!(
-                "Calculating: \n{:?}\n{:?}\nResult: {result}",
-                matrix[0], matrix[1]
-            );
             Ok(result)
         }
     }
 
-    pub fn subtract_row_and_col(matrix: &Vec<Vec<i64>>, row: usize, col: usize) -> Vec<Vec<i64>> {
+    use ipc_channel::ipc::TryRecvError;
+
+    pub fn interprocess_determinant_calculation(
+        matrix: &Vec<Vec<i64>>,
+        // sender, через который будут отправляться результаты
+        transmitter: ipc_channel::ipc::IpcSender<i64>,
+        coefficient: i64,
+        is_positive: bool,
+        verbose: bool,
+    ) {
+        // проверка на квадратность матрицы
+        if matrix.len() != matrix[0].len() {
+            println!("Matrix is not square");
+            return;
+        }
+
+        // локальный канал, для связи рекурсивных вызовов
+        let (tx, rx) = ipc_channel::ipc::channel().expect("could not create ipc channel");
+
+        if matrix.len() > 1 {
+            // форк процесса
+            match unsafe { nix::unistd::fork() } {
+                // родительный процесс обрабатывает ресивер
+                Ok(ForkResult::Parent { child }) => {
+                    // убрать tx из текущей области видимости, чтобы не было бесполезных трансмиттеров
+                    drop(tx);
+                    loop {
+                        match rx.try_recv() {
+                            Ok(res) => {
+                                if verbose {
+                                    println!("Received {res} with {:?} from PID {child}", matrix);
+                                }
+                                transmitter
+                                    .send(if is_positive {
+                                        res * coefficient
+                                    } else {
+                                        res * (-coefficient)
+                                    })
+                                    .expect("Could not send data to passed transmitter");
+                            }
+                            Err(TryRecvError::Empty) => {
+                                // задержка для наглядности процесса
+                                if verbose {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                            }
+                            Err(TryRecvError::IpcError(err)) => match err {
+                                ipc_channel::ipc::IpcError::Bincode(_) => println!("Bincode error"),
+                                ipc_channel::ipc::IpcError::Io(_) => println!("IO error"),
+                                ipc_channel::ipc::IpcError::Disconnected => {
+                                    if verbose {
+                                        println!("Receiver disconnected");
+                                    }
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                }
+                // дочерний процесс выделяет минор и рекурсивно вызывает эту же функцию
+                Ok(ForkResult::Child) => {
+                    for (col, val) in matrix.iter().enumerate() {
+                        let stripped = select_minor(matrix, 0, col);
+                        let is_positive = col as i64 % 2 == 0;
+                        let coef = matrix[0][col];
+                        interprocess_determinant_calculation(
+                            &stripped,
+                            tx.clone(),
+                            coef,
+                            is_positive,
+                            verbose,
+                        );
+                    }
+                    drop(tx);
+                    std::process::exit(0)
+                }
+                Err(_) => println!("Fork failed!"),
+            }
+        }
+
+        // когда матрица из одного элемента, тривиально высчитывается детерминант и умножается на коэффициент
+        if matrix.len() == 1 {
+            transmitter
+                .send(if is_positive {
+                    matrix[0][0] * coefficient
+                } else {
+                    -matrix[0][0] * coefficient
+                })
+                .expect("Failed at sending trivial determinant");
+        }
+    }
+
+    pub fn select_minor(matrix: &Vec<Vec<i64>>, row: usize, col: usize) -> Vec<Vec<i64>> {
         let mut new_matrix: Vec<Vec<i64>> = Vec::new();
 
         for r in 0..matrix.len() {
@@ -74,13 +148,14 @@ pub mod matrix {
                 continue;
             }
             let mut current_row: Vec<i64> = Vec::new();
+
             for c in 0..matrix[0].len() {
                 if c == col {
                     continue;
                 }
-
                 current_row.push(matrix[r][c]);
             }
+
             new_matrix.push(current_row);
         }
         new_matrix
@@ -96,10 +171,10 @@ mod tests {
     fn test_subtraction() {
         let v1 = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
 
-        let sv1 = matrix::subtract_row_and_col(&v1, 0, 0);
-        let sv2 = matrix::subtract_row_and_col(&v1, 0, 1);
-        let sv3 = matrix::subtract_row_and_col(&v1, 1, 0);
-        let sv4 = matrix::subtract_row_and_col(&v1, 1, 1);
+        let sv1 = matrix::select_minor(&v1, 0, 0);
+        let sv2 = matrix::select_minor(&v1, 0, 1);
+        let sv3 = matrix::select_minor(&v1, 1, 0);
+        let sv4 = matrix::select_minor(&v1, 1, 1);
 
         assert!(sv1.eq(&vec![vec![5, 6], vec![8, 9]]),);
         assert!(sv2.eq(&vec![vec![4, 6], vec![7, 9]]),);
