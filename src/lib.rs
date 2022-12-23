@@ -1,7 +1,10 @@
 pub mod matrix {
     use std::fmt::Error;
 
-    use nix::unistd::ForkResult;
+    use nix::{
+        sys::wait::{WaitPidFlag, WaitStatus},
+        unistd::{fork, ForkResult},
+    };
 
     #[derive(Debug)]
     pub enum MatrixCalcError {
@@ -48,12 +51,100 @@ pub mod matrix {
         }
     }
 
-    use ipc_channel::ipc::TryRecvError;
+    pub unsafe fn write_usize_to_shm(shm_ptr: *mut u8, value: usize) {
+        let shift: usize = 256;
+        for i in 1..=8_usize {
+            let byte: u8 = (value / shift.pow(8 - i as u32)) as u8;
+            // *shm_ptr.add(i-1) = byte;
+            std::ptr::write_volatile(shm_ptr.add(i - 1), byte);
+        }
+    }
 
-    pub fn interprocess_determinant_calculation(
+    pub unsafe fn read_usize_from_shm(shm_ptr: *const u8) -> usize {
+        let mut ptr_accum: usize = 0;
+        let shift: usize = 256;
+
+        for i in 1..=8 {
+            let byte: usize = std::ptr::read_volatile(shm_ptr.add(i - 1)) as usize;
+            // println!("readed byte: {:x}", byte);
+            // println!("shifted byte: {:x}", byte * shift.pow(8-i as u32));
+            ptr_accum += byte * shift.pow(8 - i as u32);
+        }
+        ptr_accum
+    }
+
+    pub unsafe fn vec_ptr_to_matrix(ptr: *const Vec<i64>) -> Vec<Vec<i64>> {
+        let mut vector = Vec::new();
+
+        for i in 0..(*ptr).len() {
+            vector.push((*ptr.add(i)).clone());
+        }
+        vector
+    }
+
+    pub unsafe fn shm_determinant_calculation(
+        // matrix: &Vec<Vec<i64>>,
+        out_shm_ptr: *mut u8,
+        coefficient: i64,
+        is_positive: bool,
+    ) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let vec_ptr = read_usize_from_shm(out_shm_ptr) as *const Vec<i64>;
+
+        let matrix = vec_ptr_to_matrix(vec_ptr);
+
+        
+        if matrix.len() > 1 {
+            let shmem = shared_memory::ShmemConf::new()
+                .size(8)
+                .create()
+                .expect("Shmem create failed");
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child }) => {
+                    while let Ok(WaitStatus::StillAlive) = nix::sys::wait::waitpid(child, None) {}
+                    let result = read_usize_from_shm(shmem.as_ptr()) as i64;
+                    println!("\tGot det {} for {:?}", result, matrix);
+                    write_usize_to_shm(
+                        out_shm_ptr,
+                        if is_positive {
+                            (result as i64 * coefficient) as usize
+                        } else {
+                            (result as i64 * -coefficient) as usize
+                        },
+                    );
+                    // return;
+                }
+                Ok(ForkResult::Child) => {
+                    println!("Child matrix {:?}", matrix);
+                    for (col, val) in matrix.iter().enumerate() {
+                        let stripped = select_minor(&matrix, 0, col);
+                        println!("Stripped is: {:?} by col {}", stripped, col);
+                        let is_positive = col as i64 % 2 == 0;
+                        let coef = matrix[0][col];
+                        write_usize_to_shm(shmem.as_ptr(), stripped.as_ptr() as usize);
+                        shm_determinant_calculation(shmem.as_ptr(), coef, is_positive);
+                    }
+                    while let Ok(WaitStatus::StillAlive) = nix::sys::wait::wait() {}
+                    std::process::exit(0);
+                }
+                Err(_) => println!("Fork failed!"),
+            }
+        }
+        if matrix.len() == 1 {
+            match is_positive {
+                true => write_usize_to_shm(out_shm_ptr, (matrix[0][0] * coefficient) as usize),
+                false => write_usize_to_shm(out_shm_ptr, (matrix[0][0] * -coefficient) as usize),
+            }
+            // std::process::exit(0);
+        }
+    }
+
+    use ipc_channel::ipc::TryRecvError;
+    pub fn channel_determinant_calculation(
         matrix: &Vec<Vec<i64>>,
         // sender, через который будут отправляться результаты
-        transmitter: ipc_channel::ipc::IpcSender<i64>,
+        out_transmitter: ipc_channel::ipc::IpcSender<i64>,
         coefficient: i64,
         is_positive: bool,
         verbose: bool,
@@ -80,7 +171,7 @@ pub mod matrix {
                                 if verbose {
                                     println!("Received {res} with {:?} from PID {child}", matrix);
                                 }
-                                transmitter
+                                out_transmitter
                                     .send(if is_positive {
                                         res * coefficient
                                     } else {
@@ -113,7 +204,7 @@ pub mod matrix {
                         let stripped = select_minor(matrix, 0, col);
                         let is_positive = col as i64 % 2 == 0;
                         let coef = matrix[0][col];
-                        interprocess_determinant_calculation(
+                        channel_determinant_calculation(
                             &stripped,
                             tx.clone(),
                             coef,
@@ -130,7 +221,7 @@ pub mod matrix {
 
         // когда матрица из одного элемента, тривиально высчитывается детерминант и умножается на коэффициент
         if matrix.len() == 1 {
-            transmitter
+            out_transmitter
                 .send(if is_positive {
                     matrix[0][0] * coefficient
                 } else {
@@ -165,10 +256,12 @@ pub mod matrix {
 #[cfg(test)]
 mod tests {
 
+    use crate::matrix::{read_usize_from_shm, write_usize_to_shm};
+
     use super::*;
 
     #[test]
-    fn test_subtraction() {
+    fn test_minor() {
         let v1 = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
 
         let sv1 = matrix::select_minor(&v1, 0, 0);
@@ -183,40 +276,21 @@ mod tests {
     }
 
     #[test]
-    fn test_determinant() {
-        let v1 = vec![vec![1, 2], vec![3, 4]];
-        let v2 = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
+    fn test_read_write_shm() {
+        let shm = shared_memory::ShmemConf::new()
+            .size(8)
+            .create()
+            .expect("Failed at creating Shmem");
 
-        let v3 = vec![
-            vec![4, 7, 9, 5],
-            vec![3, 6, 9, 4],
-            vec![0, 4, 26, 8],
-            vec![9, 6, 3, 7],
-        ];
-        let v4 = vec![
-            vec![1, 2, 3, 4, 5],
-            vec![6, 7, 8, 9, 10],
-            vec![11, 12, 13, 14, 15],
-            vec![16, 17, 18, 19, 20],
-            vec![21, 22, 23, 24, 25],
-        ];
-        let v5 = vec![
-            vec![43, 76, -65, -12],
-            vec![22, -87, 99, -22],
-            vec![-76, 89, 57, -43],
-            vec![43, -75, -62, 18],
-        ];
+        let shm_ptr = shm.as_ptr();
 
-        assert_eq!(matrix::calculate_determinant(&v1, None, None).unwrap(), -2);
-        assert_eq!(matrix::calculate_determinant(&v2, None, None).unwrap(), 0);
-        assert_eq!(
-            matrix::calculate_determinant(&v3, None, None).unwrap(),
-            -282
-        );
-        assert_eq!(matrix::calculate_determinant(&v4, None, None).unwrap(), 0);
-        assert_eq!(
-            matrix::calculate_determinant(&v5, None, None).unwrap(),
-            30898426
-        );
+        let original_value: usize = 0x123456789abcdef0;
+
+        unsafe {
+            write_usize_to_shm(shm_ptr, original_value);
+            let read_value = read_usize_from_shm(shm_ptr);
+
+            assert_eq!(original_value, read_value)
+        }
     }
 }
