@@ -83,18 +83,17 @@ pub mod matrix {
     }
 
     pub unsafe fn shm_determinant_calculation(
-        // matrix: &Vec<Vec<i64>>,
+        matrix: &Vec<Vec<i64>>,
         out_shm_ptr: *mut u8,
         coefficient: i64,
         is_positive: bool,
     ) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let vec_ptr = read_usize_from_shm(out_shm_ptr) as *const Vec<i64>;
+        // let vec_ptr = read_usize_from_shm(out_shm_ptr) as *const Vec<i64>;
 
-        let matrix = vec_ptr_to_matrix(vec_ptr);
+        // let matrix = vec_ptr_to_matrix(vec_ptr);
 
-        
         if matrix.len() > 1 {
             let shmem = shared_memory::ShmemConf::new()
                 .size(8)
@@ -105,13 +104,16 @@ pub mod matrix {
                     while let Ok(WaitStatus::StillAlive) = nix::sys::wait::waitpid(child, None) {}
                     let result = read_usize_from_shm(shmem.as_ptr()) as i64;
                     println!("\tGot det {} for {:?}", result, matrix);
+                    let read = read_usize_from_shm(out_shm_ptr) as i64;
+                    let module = result * coefficient;
+                    let write = if is_positive {
+                        read + module 
+                    } else {
+                        read - module 
+                    };
                     write_usize_to_shm(
                         out_shm_ptr,
-                        if is_positive {
-                            (result as i64 * coefficient) as usize
-                        } else {
-                            (result as i64 * -coefficient) as usize
-                        },
+                        write as usize,
                     );
                     // return;
                 }
@@ -122,8 +124,8 @@ pub mod matrix {
                         println!("Stripped is: {:?} by col {}", stripped, col);
                         let is_positive = col as i64 % 2 == 0;
                         let coef = matrix[0][col];
-                        write_usize_to_shm(shmem.as_ptr(), stripped.as_ptr() as usize);
-                        shm_determinant_calculation(shmem.as_ptr(), coef, is_positive);
+                        // write_usize_to_shm(shmem.as_ptr(), stripped.as_ptr() as usize);
+                        shm_determinant_calculation(&stripped, shmem.as_ptr(), coef, is_positive);
                     }
                     while let Ok(WaitStatus::StillAlive) = nix::sys::wait::wait() {}
                     std::process::exit(0);
@@ -132,9 +134,23 @@ pub mod matrix {
             }
         }
         if matrix.len() == 1 {
+            let read = read_usize_from_shm(out_shm_ptr) as i64;
+            let module = matrix[0][0] * coefficient;
+            let write = if is_positive {
+                module + read
+            } else {
+                -module + read
+            };
+            println!("\tRead {} from shared memory", read);
+            println!("\tDet is {}", module);
+            println!("\tWrite {} to shared memory", write);
             match is_positive {
-                true => write_usize_to_shm(out_shm_ptr, (matrix[0][0] * coefficient) as usize),
-                false => write_usize_to_shm(out_shm_ptr, (matrix[0][0] * -coefficient) as usize),
+                true => {
+                    write_usize_to_shm(out_shm_ptr, write as usize)
+                }
+                false => {
+                    write_usize_to_shm(out_shm_ptr, write as usize)
+                }
             }
             // std::process::exit(0);
         }

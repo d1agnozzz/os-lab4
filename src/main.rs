@@ -76,7 +76,7 @@ fn main() {
 
 
 
-    sh_mem(&matrix_3);
+    sh_mem(&matrix_1);
 
     // match  unsafe{fork()} {
     //     Ok(ForkResult::Parent { child }) => {
@@ -187,8 +187,8 @@ fn sh_mem(matrix: &Vec<Vec<i64>>) {
 
     
     unsafe {
-        write_usize_to_shm(shmem.as_ptr(), matrix.as_ptr() as usize);
-        shm_determinant_calculation(shmem.as_ptr(), 1, true);
+        // write_usize_to_shm(shmem.as_ptr(), matrix.as_ptr() as usize);
+        shm_determinant_calculation(matrix, shmem.as_ptr(), 1, true);
         thread::sleep(std::time::Duration::from_millis(1000));
         let determinant = read_usize_from_shm(shmem.as_ptr());
         println!("Shmem determinant is {}", determinant as i64);
