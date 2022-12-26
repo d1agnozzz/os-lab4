@@ -6,11 +6,6 @@ pub mod matrix {
         unistd::{fork, ForkResult},
     };
 
-    #[derive(Debug)]
-    pub enum MatrixCalcError {
-        NonSquare,
-    }
-
     pub fn print_matrix(matrix: &Vec<Vec<i64>>) {
         for row in matrix {
             println!("{:?}", row);
@@ -19,35 +14,96 @@ pub mod matrix {
 
     pub fn calculate_determinant(
         matrix: &Vec<Vec<i64>>,
-        exclude_row: Option<usize>,
-        _exclude_col: Option<usize>,
-    ) -> Result<i64, MatrixCalcError> {
-        if matrix.len() != matrix[0].len() {
-            return Err(MatrixCalcError::NonSquare);
+        coefficient_arg: i64,
+        is_positive_arg: bool,
+    ) -> i64 {
+        if matrix.len() > 1 {
+            let mut calculated = Vec::with_capacity(matrix.len());
+            for (ind, row) in matrix.iter().enumerate() {
+                let stripped = select_minor(matrix, ind, 0);
+                let is_positive = ind % 2 == 0;
+                let coefficient = row[0];
+                calculated.push(match is_positive_arg {
+                    true => {
+                        coefficient_arg * calculate_determinant(&stripped, coefficient, is_positive)
+                    }
+                    false => {
+                        -coefficient_arg
+                            * calculate_determinant(&stripped, coefficient, is_positive)
+                    }
+                })
+                // return calculate_determinant(&stripped, coefficient, is_positive);
+            }
+            return calculated.iter().sum();
+        } else {
+            return match is_positive_arg {
+                true => matrix[0][0] * coefficient_arg,
+                false => matrix[0][0] * -coefficient_arg,
+            };
+        }
+    }
+
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    
+    fn calculate_matrix_slice_and_write_socket(
+        matrix: &Vec<Vec<i64>>,
+        socket_path: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let data = calculate_slice(matrix, start, end);
+
+        let mut unix_stream =
+            UnixStream::connect(socket_path).expect("Failed at creating unix stream");
+
+        write_request_and_shutdown(&mut unix_stream, &data.to_ne_bytes())
+    }
+
+    fn write_request_and_shutdown(unix_stream: &mut UnixStream, data: &[u8]) {
+        unix_stream
+            .write(data)
+            .expect("Failed at writing onto the stream");
+
+        println!("Request sent");
+        println!("Shutting down writing on the stream, waiting for response...");
+
+        unix_stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("Could not shutdown writing on the stream");
+    }
+
+    pub fn calculate_slice(matrix: &Vec<Vec<i64>>, start: usize, end: usize) -> i64 {
+        assert!(start < end);
+        let mut calculated = Vec::with_capacity(end - start);
+
+        for i in start..end {
+            let stripped = select_minor(matrix, 0, i);
+            let coefficient = matrix[0][i];
+            let is_positive = i % 2 == 0;
+            calculated.push(calculate_determinant(&stripped, coefficient, is_positive));
         }
 
-        if matrix.len() > 2 {
-            match exclude_row {
-                None => calculate_determinant(matrix, Some(0), Some(0)),
-                Some(row) => {
-                    if row >= matrix.len() {
-                        Ok(0)
-                    } else {
-                        let stripped_matrix = select_minor(matrix, row, 0);
-                        let sign = ((row as i64 % 2) * -2) + 1;
-                        let coef = matrix[row][0];
-                        let deeper_det =
-                            calculate_determinant(&stripped_matrix, Some(0), _exclude_col)
-                                .expect("msg");
-                        // let next_det = calculate_determinant(matrix, Some(row + 1), _exclude_col)
-                        //     .expect("msg");
-                        Ok(sign * coef * deeper_det)
-                    }
-                }
+        return calculated.iter().sum();
+    }
+
+    pub unsafe fn socket_calculate_determinant(matrix: &Vec<Vec<i64>>, socket_path: &str) {
+        match unsafe { fork() } {
+            Ok(ForkResult::Parent { child }) => match unsafe { fork() } {
+                Ok(ForkResult::Parent { child }) => (),
+                Ok(ForkResult::Child) => calculate_matrix_slice_and_write_socket(
+                    matrix,
+                    socket_path,
+                    matrix.len()/2,
+                    matrix.len(),
+                ),
+                Err(_) => todo!(),
+            },
+            Ok(ForkResult::Child) => {
+                calculate_matrix_slice_and_write_socket(matrix, socket_path, 0, matrix.len() / 2)
             }
-        } else {
-            let result = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
-            Ok(result)
+            Err(_) => todo!(),
         }
     }
 
@@ -107,23 +163,20 @@ pub mod matrix {
                     let read = read_usize_from_shm(out_shm_ptr) as i64;
                     let module = result * coefficient;
                     let write = if is_positive {
-                        read + module 
+                        read + module
                     } else {
-                        read - module 
+                        read - module
                     };
-                    write_usize_to_shm(
-                        out_shm_ptr,
-                        write as usize,
-                    );
+                    write_usize_to_shm(out_shm_ptr, write as usize);
                     // return;
                 }
                 Ok(ForkResult::Child) => {
                     println!("Child matrix {:?}", matrix);
-                    for (col, val) in matrix.iter().enumerate() {
-                        let stripped = select_minor(&matrix, 0, col);
-                        println!("Stripped is: {:?} by col {}", stripped, col);
-                        let is_positive = col as i64 % 2 == 0;
-                        let coef = matrix[0][col];
+                    for (ind, row) in matrix.iter().enumerate() {
+                        let stripped = select_minor(&matrix, ind, 0);
+                        println!("Stripped is: {:?} by col {}", stripped, ind);
+                        let is_positive = ind as i64 % 2 == 0;
+                        let coef = row[0];
                         // write_usize_to_shm(shmem.as_ptr(), stripped.as_ptr() as usize);
                         shm_determinant_calculation(&stripped, shmem.as_ptr(), coef, is_positive);
                     }
@@ -145,12 +198,8 @@ pub mod matrix {
             println!("\tDet is {}", module);
             println!("\tWrite {} to shared memory", write);
             match is_positive {
-                true => {
-                    write_usize_to_shm(out_shm_ptr, write as usize)
-                }
-                false => {
-                    write_usize_to_shm(out_shm_ptr, write as usize)
-                }
+                true => write_usize_to_shm(out_shm_ptr, write as usize),
+                false => write_usize_to_shm(out_shm_ptr, write as usize),
             }
             // std::process::exit(0);
         }
@@ -267,14 +316,82 @@ pub mod matrix {
         }
         new_matrix
     }
+
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    pub fn read_matrix(path: &str) -> Vec<Vec<i64>> {
+        let mut f = BufReader::new(File::open(path).unwrap());
+
+        let arr: Vec<Vec<i64>> = f
+            .lines()
+            .map(|l| {
+                l.unwrap()
+                    .split(char::is_whitespace)
+                    .map(|number| number.parse().unwrap())
+                    .collect()
+            })
+            .collect();
+
+        return arr;
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::matrix::{read_usize_from_shm, write_usize_to_shm};
+    use crate::matrix::*;
 
     use super::*;
+
+    const TEST_DATA_PATH: &str = "src/test_data";
+
+    // const matrix: [[i64; 2]; 2] = [[1, 2], [3, 4]];
+
+    // const matrix_1: (Matrix, Determinant)     = ([[4, 7, 9, 5], [3, 6, 9, 4], [0, 4, 26, 8], [9, 6, 3, 7]], -282);
+
+    // const matrix_: [[i64; 3]; 3] = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+
+    fn get_test_data() -> Vec<Vec<Vec<i64>>> {
+        return vec![
+            read_matrix(&format!("{}/-282.txt", TEST_DATA_PATH)),
+            read_matrix(&format!("{}/0a.txt", TEST_DATA_PATH)),
+            read_matrix(&format!("{}/0b.txt", TEST_DATA_PATH)),
+            read_matrix(&format!("{}/0c.txt", TEST_DATA_PATH)),
+        ];
+    }
+
+    #[test]
+    fn test_slice_calculation() {
+        let test_data = get_test_data();
+
+        for matrix in test_data {
+            let first = calculate_slice(&matrix, 0, matrix.len() / 2);
+            let second = calculate_slice(&matrix, matrix.len() / 2, matrix.len());
+            let whole = calculate_determinant(&matrix, 1, true);
+
+            assert_eq!(first + second, whole);
+        }
+    }
+
+    #[test]
+    fn test_reading_matrix_from_file() {
+        let reference: Vec<Vec<i64>> = vec![
+            vec![4, 7, 9, 5],
+            vec![3, 6, 9, 4],
+            vec![0, 4, 26, 8],
+            vec![9, 6, 3, 7],
+        ];
+
+        let read = read_matrix("src/test_data/-282.txt");
+
+        print_matrix(&read);
+
+        for (refer, result) in reference.iter().zip(read) {
+            for (i, j) in refer.iter().zip(result) {
+                assert_eq!(*i, j);
+            }
+        }
+    }
 
     #[test]
     fn test_minor() {
